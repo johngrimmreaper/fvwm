@@ -1,0 +1,418 @@
+name: Build FVWM EPEL 10 RPM
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-rpm:
+    name: EPEL 10 SRPM and RPM build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: almalinux:10
+
+    steps:
+      - name: Prepare AlmaLinux 10 build repositories and tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/build-artifacts
+          mkdir -p /tmp/build-artifacts
+          cat /etc/almalinux-release | tee /tmp/build-artifacts/almalinux-release.txt
+          dnf -y install dnf-plugins-core epel-release 2>&1 | tee /tmp/build-artifacts/repository-bootstrap.log
+          dnf config-manager --set-enabled crb 2>&1 | tee /tmp/build-artifacts/enable-crb.log
+          dnf -y --setopt=install_weak_deps=False install \
+            file \
+            findutils \
+            git \
+            gzip \
+            rpmautospec \
+            rpm-build \
+            rpmdevtools \
+            tar 2>&1 | tee /tmp/build-artifacts/tooling-install.log
+          command -v curl | tee /tmp/build-artifacts/curl-command.txt
+          rpm -qf "$(command -v curl)" | tee /tmp/build-artifacts/curl-provider.txt
+          command -v rpmautospec | tee /tmp/build-artifacts/rpmautospec-command.txt
+          rpm -q rpmautospec | tee /tmp/build-artifacts/rpmautospec-package.txt
+          dnf repolist --enabled | tee /tmp/build-artifacts/enabled-repositories-before-reaper.txt
+
+      - name: Install and validate Reaper EL10 repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_id=reaper-rhel-10-stable
+          repo_file=/etc/yum.repos.d/reaper-rhel-10-stable.repo
+          repo_url=https://johngrimmreaper.github.io/rpm-packages/repo/reaper-rhel-10-stable.repo
+
+          curl --fail --show-error --location --retry 3 \
+            --proto '=https' --tlsv1.2 \
+            --output "$repo_file" \
+            "$repo_url"
+
+          cat "$repo_file" | tee /tmp/build-artifacts/reaper-repository.txt
+          grep -Fx '[reaper-rhel-10-stable]' "$repo_file"
+          grep -Fx 'enabled=1' "$repo_file"
+          grep -Fx 'gpgcheck=1' "$repo_file"
+          grep -Fx 'repo_gpgcheck=1' "$repo_file"
+          grep -Fx 'baseurl=https://johngrimmreaper.github.io/rpm-packages/stable/rhel/10/$basearch' "$repo_file"
+          grep -Fx 'gpgkey=https://johngrimmreaper.github.io/rpm-packages/RPM-GPG-KEY' "$repo_file"
+
+          dnf -y --disablerepo='*' --enablerepo="$repo_id" makecache \
+            2>&1 | tee /tmp/build-artifacts/reaper-makecache.log
+          dnf repolist --enabled | tee /tmp/build-artifacts/enabled-repositories.txt
+          dnf repolist --enabled | awk 'NR > 1 {print $1}' | grep -Fx "$repo_id"
+
+          arch="$(uname -m)"
+          dnf -q repoquery \
+            --disablerepo='*' \
+            --enablerepo="$repo_id" \
+            --arch="$arch" \
+            --qf '%{name}|%{version}|%{release}|%{repoid}' \
+            xlockmore \
+            | LC_ALL=C sort \
+            | tee /tmp/build-artifacts/reaper-xlockmore-query.txt
+          grep -Fx "xlockmore|5.88|2.el10|$repo_id" \
+            /tmp/build-artifacts/reaper-xlockmore-query.txt
+          test "$(wc -l < /tmp/build-artifacts/reaper-xlockmore-query.txt)" -eq 1
+
+      - name: Check out EPEL 10 packaging branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Prepare Fedora-verbatim packaging for the tested Git commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          topdir="$GITHUB_WORKSPACE/rpmbuild"
+          mkdir -p artifacts
+          cp -a /tmp/build-artifacts/. artifacts/
+          mkdir -p "$topdir"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          printf '%s\n' "$GITHUB_SHA" | tee artifacts/git-commit.txt
+          printf '%s\n' "$GITHUB_REF" | tee artifacts/git-ref.txt
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+          grep -Eq '^Release:[[:space:]]*%autorelease$' fvwm.spec
+          grep -Eq '^Requires:[[:space:]]*xlockmore$' fvwm.spec
+          ! grep -Eq '^Suggests:[[:space:]]*xlockmore$' fvwm.spec
+          grep -Eq '^%autochangelog$' fvwm.spec
+          cp fvwm.spec artifacts/fvwm.spec.verbatim
+
+          processed_spec="$topdir/SPECS/fvwm.spec"
+          rpmautospec process-distgit fvwm.spec "$processed_spec" \
+            2>&1 | tee artifacts/rpmautospec-process-distgit.log
+          test -s "$processed_spec"
+          cp "$processed_spec" artifacts/fvwm.spec.processed
+
+          rpmspec -q --qf '%{NAME}|%{VERSION}|%{RELEASE}\n' "$processed_spec" \
+            | LC_ALL=C sort -u | tee artifacts/processed-nevr.txt
+          awk '/^%changelog$/ {emit=1} emit' "$processed_spec" \
+            | tee artifacts/processed-changelog.txt
+          test -s artifacts/processed-nevr.txt
+          grep -Fx '%changelog' artifacts/processed-changelog.txt
+          test "$(wc -l < artifacts/processed-changelog.txt)" -gt 1
+          ! grep -F '%autorelease' artifacts/processed-nevr.txt
+          ! grep -F '%autochangelog' artifacts/processed-changelog.txt
+
+          cp fvwm.desktop "$topdir/SOURCES/"
+          cp fvwm-*.patch "$topdir/SOURCES/"
+
+          rpmspec -P "$processed_spec" > artifacts/fvwm-spec-expanded.txt
+          source_url="$(awk '$1 == "Source0:" {print $2; exit}' artifacts/fvwm-spec-expanded.txt)"
+          test -n "$source_url"
+          source_name="$(basename "$source_url")"
+          version="$(rpmspec -q --qf '%{VERSION}\n' "$processed_spec" | head -n 1)"
+          test "$version" = 2.7.0
+          test "$source_name" = "fvwm-$version.tar.gz"
+          printf '%s\n' "$source_url" | tee artifacts/source0-url.txt
+
+          source_dir="fvwm-$version"
+          git archive --format=tar --prefix="$source_dir/" "$GITHUB_SHA" \
+            | gzip -n > "$topdir/SOURCES/$source_name"
+          test -s "$topdir/SOURCES/$source_name"
+
+          find "$topdir/SOURCES" -maxdepth 1 -type f -printf '%f\n' \
+            | LC_ALL=C sort | tee artifacts/rpm-sources.txt
+          cp sources artifacts/
+
+      - name: Install EPEL 10 FVWM build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          topdir="$GITHUB_WORKSPACE/rpmbuild"
+          dnf -y --setopt=install_weak_deps=False \
+            builddep "$topdir/SPECS/fvwm.spec" 2>&1 | tee artifacts/builddep.log
+          rpm -qa | LC_ALL=C sort > artifacts/installed-build-environment.txt
+
+      - name: Build EPEL 10 source and binary RPMs
+        shell: bash
+        run: |
+          set -euo pipefail
+          topdir="$GITHUB_WORKSPACE/rpmbuild"
+
+          # Keep configure from recording runner-specific sbin aliases when a
+          # canonical executable exists in /usr/bin.
+          export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+          printf 'rpmbuild PATH=%s\n' "$PATH" | tee artifacts/rpmbuild-path.txt
+
+          rpmbuild -ba \
+            --define "_topdir $topdir" \
+            "$topdir/SPECS/fvwm.spec" 2>&1 | tee artifacts/rpmbuild.log
+
+          find "$topdir/SRPMS" -type f -name '*.src.rpm' -print \
+            | LC_ALL=C sort | tee artifacts/epel10-srpms.txt
+          find "$topdir/RPMS" -type f -name '*.rpm' -print \
+            | LC_ALL=C sort | tee artifacts/epel10-rpms.txt
+          test -s artifacts/epel10-srpms.txt
+          test -s artifacts/epel10-rpms.txt
+
+          srpm="$(head -n 1 artifacts/epel10-srpms.txt)"
+          rpm -qp --changelog "$srpm" | tee artifacts/srpm-changelog.txt
+          test -s artifacts/srpm-changelog.txt
+
+      - name: Inspect EPEL 10 RPM metadata and payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r rpm_file; do
+            name="$(basename "$rpm_file")"
+            stem="${name%.rpm}"
+            rpm -qip "$rpm_file" > "artifacts/${stem}-info.txt"
+            rpm -qpR "$rpm_file" | LC_ALL=C sort > "artifacts/${stem}-requires.txt"
+            rpm -qp --suggests "$rpm_file" | LC_ALL=C sort > "artifacts/${stem}-suggests.txt"
+            rpm -qpl "$rpm_file" | LC_ALL=C sort > "artifacts/${stem}-files.txt"
+            rpm -qp --provides "$rpm_file" | LC_ALL=C sort > "artifacts/${stem}-provides.txt"
+          done < artifacts/epel10-rpms.txt
+
+          arch="$(uname -m)"
+          mapfile -t candidates < <(
+            find "$GITHUB_WORKSPACE/rpmbuild/RPMS" -type f \
+              -name "fvwm-2.7.0-*.${arch}.rpm" -print | LC_ALL=C sort
+          )
+          test "${#candidates[@]}" -eq 1
+          main_rpm="${candidates[0]}"
+          basename "$main_rpm" | tee artifacts/main-rpm-basename.txt
+          printf '%s\n' "$main_rpm" | tee artifacts/main-rpm.txt
+
+          rpm -qpR "$main_rpm" | tee artifacts/main-requires.txt
+          rpm -qp --suggests "$main_rpm" | tee artifacts/main-suggests.txt
+          rpm -qpl "$main_rpm" | tee artifacts/main-files.txt
+
+          grep -Fx 'xlockmore' artifacts/main-requires.txt
+          ! grep -Fx 'xlockmore' artifacts/main-suggests.txt
+          grep -Fx '/usr/bin/fvwm' artifacts/main-files.txt
+          grep -Fx '/usr/bin/fvwm-menu-xlock' artifacts/main-files.txt
+          grep -Fx '/usr/share/xsessions/fvwm.desktop' artifacts/main-files.txt
+          if grep -F '/usr/local/' artifacts/main-files.txt; then
+            echo 'EPEL 10 RPM unexpectedly installs under /usr/local.' >&2
+            exit 1
+          fi
+
+      - name: Preserve EPEL 10 package artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/packages
+          while IFS= read -r rpm_file; do
+            cp -a "$rpm_file" artifacts/packages/
+          done < artifacts/epel10-rpms.txt
+          while IFS= read -r srpm_file; do
+            cp -a "$srpm_file" artifacts/packages/
+          done < artifacts/epel10-srpms.txt
+
+      - name: Upload EPEL 10 build evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fvwm-epel10-rpm-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+  runtime-test:
+    name: AlmaLinux 10 clean RPM install and Xvfb smoke test
+    needs: build-rpm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: almalinux:10
+
+    steps:
+      - name: Prepare AlmaLinux 10 runtime repositories
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime-artifacts
+          cat /etc/almalinux-release | tee runtime-artifacts/almalinux-release.txt
+          grep -E '^[[:space:]]*tsflags=' /etc/dnf/dnf.conf \
+            | tee runtime-artifacts/dnf-container-tsflags.txt || true
+          dnf -y install \
+            dnf-plugins-core \
+            epel-release \
+            almalinux-release-devel 2>&1 | tee runtime-artifacts/repository-bootstrap.log
+          dnf config-manager --set-enabled crb 2>&1 | tee runtime-artifacts/enable-crb.log
+
+      - name: Install and validate Reaper EL10 runtime repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_id=reaper-rhel-10-stable
+          repo_file=/etc/yum.repos.d/reaper-rhel-10-stable.repo
+          repo_url=https://johngrimmreaper.github.io/rpm-packages/repo/reaper-rhel-10-stable.repo
+
+          curl --fail --show-error --location --retry 3 \
+            --proto '=https' --tlsv1.2 \
+            --output "$repo_file" \
+            "$repo_url"
+          cat "$repo_file" | tee runtime-artifacts/reaper-repository.txt
+          grep -Fx 'enabled=1' "$repo_file"
+          grep -Fx 'gpgcheck=1' "$repo_file"
+          grep -Fx 'repo_gpgcheck=1' "$repo_file"
+
+          dnf -y --disablerepo='*' --enablerepo="$repo_id" makecache \
+            2>&1 | tee runtime-artifacts/reaper-makecache.log
+          dnf repolist --enabled | tee runtime-artifacts/enabled-repositories.txt
+          dnf repolist --enabled | awk 'NR > 1 {print $1}' | grep -Fx "$repo_id"
+
+          arch="$(uname -m)"
+          dnf -q repoquery \
+            --disablerepo='*' \
+            --enablerepo="$repo_id" \
+            --arch="$arch" \
+            --qf '%{name}|%{version}|%{release}|%{repoid}' \
+            xlockmore \
+            | LC_ALL=C sort \
+            | tee runtime-artifacts/reaper-xlockmore-query.txt
+          grep -Fx "xlockmore|5.88|2.el10|$repo_id" \
+            runtime-artifacts/reaper-xlockmore-query.txt
+          test "$(wc -l < runtime-artifacts/reaper-xlockmore-query.txt)" -eq 1
+
+      - name: Download EPEL 10 RPM artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: fvwm-epel10-rpm-${{ github.sha }}
+          path: epel10-artifact
+
+      - name: Install built FVWM RPM with normal dependency resolution
+        shell: bash
+        run: |
+          set -euo pipefail
+          main_name="$(cat epel10-artifact/main-rpm-basename.txt)"
+          main_rpm="epel10-artifact/packages/$main_name"
+          test -f "$main_rpm"
+          printf '%s\n' "$main_rpm" | tee runtime-artifacts/main-rpm.txt
+
+          # Xvfb is CI-only test infrastructure from AlmaLinux Devel. FVWM
+          # itself is installed as a local RPM through DNF, with all runtime
+          # requirements resolved normally from configured repositories.
+          dnf -y \
+            --setopt=install_weak_deps=False \
+            --setopt=tsflags= \
+            install \
+            file \
+            xorg-x11-server-Xvfb \
+            "$main_rpm" 2>&1 | tee runtime-artifacts/runtime-install.log
+          dnf history info last | tee runtime-artifacts/runtime-dnf-history.txt
+
+          rpm -q fvwm | tee runtime-artifacts/installed-fvwm.txt
+          rpm -q xlockmore | tee runtime-artifacts/installed-xlockmore.txt
+          arch="$(uname -m)"
+          xlock_nevra="$(rpm -q --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' xlockmore)"
+          printf '%s\n' "$xlock_nevra" | tee runtime-artifacts/installed-xlockmore-nevra.txt
+          test "$xlock_nevra" = "xlockmore-5.88-2.el10.$arch"
+
+          rpm -V fvwm | tee runtime-artifacts/rpm-verify.txt
+          rpm -ql fvwm | LC_ALL=C sort | tee runtime-artifacts/rpm-files.txt
+          rpm -qR fvwm | LC_ALL=C sort | tee runtime-artifacts/rpm-requires.txt
+          rpm -q --suggests fvwm | LC_ALL=C sort | tee runtime-artifacts/rpm-suggests.txt
+          grep -Fx 'xlockmore' runtime-artifacts/rpm-requires.txt
+          ! grep -Fx 'xlockmore' runtime-artifacts/rpm-suggests.txt
+          rpm -qa | LC_ALL=C sort > runtime-artifacts/installed-runtime-environment.txt
+
+      - name: Validate installed AlmaLinux 10 FVWM layout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -x /usr/bin/fvwm
+          test -x /usr/bin/FvwmCommand
+          test -x /usr/bin/fvwm-menu-xlock
+          test -f /usr/share/fvwm/ConfigFvwmDefaults
+          test -f /usr/share/xsessions/fvwm.desktop
+          test -f /usr/share/man/man1/fvwm.1.gz
+          test -d /usr/share/fvwm/perllib/FVWM
+          test -d /usr/libexec/fvwm
+
+          module_root=/usr/libexec/fvwm
+          mapfile -t module_dirs < <(
+            find "$module_root" -mindepth 1 -maxdepth 1 -type d -print | LC_ALL=C sort
+          )
+          test "${#module_dirs[@]}" -eq 1
+          module_dir="${module_dirs[0]}"
+          printf '%s\n' "$module_dir" | tee runtime-artifacts/module-directory.txt
+
+          for module in \
+            FvwmButtons FvwmPager FvwmScript FvwmIconMan FvwmConsole \
+            FvwmCommandS FvwmEvent FvwmForm FvwmRearrange
+          do
+            test -x "$module_dir/$module"
+          done
+          test -L "$module_dir/FvwmAudio"
+          test "$(readlink "$module_dir/FvwmAudio")" = FvwmEvent
+
+          file /usr/bin/fvwm | tee runtime-artifacts/fvwm-file.txt
+          /usr/bin/fvwm -version 2>&1 | tee runtime-artifacts/fvwm-version.txt
+          find "$module_dir" -maxdepth 1 \( -type f -o -type l \) -printf '%f\n' \
+            | LC_ALL=C sort | tee runtime-artifacts/modules.txt
+
+          if rpm -ql fvwm | grep -F '/usr/local/'; then
+            echo 'Installed EPEL 10 package owns files under /usr/local.' >&2
+            exit 1
+          fi
+
+      - name: X11 smoke test installed EPEL 10 RPM
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DISPLAY=:99
+          Xvfb "$DISPLAY" -screen 0 1024x768x24 >runtime-artifacts/xvfb.log 2>&1 &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" 2>/dev/null || :' EXIT
+
+          for _ in {1..20}; do
+            if test -S /tmp/.X11-unix/X99; then break; fi
+            sleep 0.25
+          done
+          test -S /tmp/.X11-unix/X99
+
+          set +e
+          timeout 5s /usr/bin/fvwm -f /dev/null >runtime-artifacts/fvwm-xvfb.log 2>&1
+          rc=$?
+          set -e
+
+          cat runtime-artifacts/fvwm-xvfb.log
+          printf 'exit=%d\n' "$rc" | tee runtime-artifacts/fvwm-xvfb-status.txt
+          if test "$rc" -ne 0 && test "$rc" -ne 124; then
+            echo "FVWM exited unexpectedly during Xvfb smoke test: rc=$rc" >&2
+            exit "$rc"
+          fi
+          if grep -F "ConfigFvwmDefaults' not found" runtime-artifacts/fvwm-xvfb.log; then
+            echo 'Installed EPEL 10 RPM could not locate its default FVWM configuration.' >&2
+            exit 1
+          fi
+
+      - name: Upload AlmaLinux 10 runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fvwm-epel10-runtime-${{ github.sha }}
+          path: runtime-artifacts/
+          if-no-files-found: error
+          retention-days: 30

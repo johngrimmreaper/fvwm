@@ -1,0 +1,222 @@
+name: Build FVWM from source
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-build:
+    name: Fedora 44 source build and staged /usr/local install
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: fedora:44
+    env:
+      # FVWM's configure warning probe predates GCC 14. GCC 14+ promotes
+      # these diagnostics to errors by default; downgrade only those two
+      # diagnostics so the probe can continue to serve its intended purpose.
+      CFLAGS: -Wno-error=int-conversion -Wno-error=incompatible-pointer-types
+
+    steps:
+      - name: Install source build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf -y --setopt=install_weak_deps=False install \
+            autoconf \
+            automake \
+            file \
+            findutils \
+            fontconfig-devel \
+            freetype-devel \
+            fribidi-devel \
+            gcc \
+            gettext \
+            gettext-devel \
+            git \
+            libICE-devel \
+            libSM-devel \
+            libX11-devel \
+            libXcursor-devel \
+            libXext-devel \
+            libXft-devel \
+            libXi-devel \
+            libXinerama-devel \
+            libXpm-devel \
+            libXrender-devel \
+            libXt-devel \
+            libpng-devel \
+            libtool \
+            libxslt \
+            make \
+            ncurses-devel \
+            patch \
+            perl \
+            perl-devel \
+            pkgconf-pkg-config \
+            python3 \
+            readline-devel \
+            tar \
+            xorg-x11-server-Xvfb
+          dnf clean all
+
+      - name: Check out exact Git commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Trust checked-out workspace in job container
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Record source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            printf 'GITHUB_SHA=%s\n' "$GITHUB_SHA"
+            printf 'HEAD=%s\n' "$(git rev-parse HEAD)"
+            printf 'describe=%s\n' "$(git describe --always --long --dirty)"
+            printf 'branch=%s\n' "$GITHUB_REF_NAME"
+            printf 'CFLAGS=%s\n' "$CFLAGS"
+          } | tee artifacts/source-identity.txt
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Show build documentation and configure surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat INSTALL.md | tee artifacts/INSTALL.md.txt
+          ./autogen.sh 2>&1 | tee artifacts/configure.log
+          ./configure --help > artifacts/configure-help.txt
+
+      - name: Record configured features
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '=== configure cache feature probes ==='
+            grep -E '^(ac_cv_lib_|ac_cv_header_|with_|problem_|PYTHON=|PERL=)' config.log || true
+            echo
+            echo '=== selected config.h feature defines ==='
+            grep -E '^#define (HAVE_|SESSION|SHAPE|MULTIBYTE|HAVE_X)' config.h || true
+          } | tee artifacts/configured-features.txt
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          jobs="$(getconf _NPROCESSORS_ONLN)"
+          make -j"$jobs" V=1 2>&1 | tee artifacts/build.log
+
+      - name: Run upstream check target
+        shell: bash
+        run: |
+          set -euo pipefail
+          jobs="$(getconf _NPROCESSORS_ONLN)"
+          make -j"$jobs" check V=1 2>&1 | tee artifacts/check.log
+
+      - name: Install into staging root
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$GITHUB_WORKSPACE/_staging"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          make DESTDIR="$stage" install 2>&1 | tee artifacts/install.log
+          find "$stage" -printf '%P\n' | LC_ALL=C sort > artifacts/installed-files.txt
+          cat artifacts/installed-files.txt
+          test -d "$stage/usr/local"
+
+      - name: Validate installed FVWM and modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$GITHUB_WORKSPACE/_staging"
+          fvwm_bin="$stage/usr/local/bin/fvwm"
+          test -x "$fvwm_bin"
+          file "$fvwm_bin" | tee artifacts/fvwm-file.txt
+          "$fvwm_bin" -version 2>&1 | tee artifacts/fvwm-version.txt
+
+          module_root="$stage/usr/local/libexec/fvwm"
+          test -d "$module_root"
+          mapfile -t module_dirs < <(find "$module_root" -mindepth 1 -maxdepth 1 -type d -print | LC_ALL=C sort)
+          if test "${#module_dirs[@]}" -ne 1; then
+            printf 'Expected exactly one FVWM module version directory, found %d\n' "${#module_dirs[@]}" >&2
+            printf '%s\n' "${module_dirs[@]}" >&2
+            exit 1
+          fi
+          module_dir="${module_dirs[0]}"
+          printf '%s\n' "$module_dir" | tee artifacts/module-directory.txt
+
+          find "$module_dir" -maxdepth 1 \( -type f -o -type l \) -printf '%f\n' \
+            | LC_ALL=C sort | tee artifacts/modules.txt
+
+          test -x "$stage/usr/local/bin/FvwmCommand"
+          for module in \
+            FvwmButtons \
+            FvwmPager \
+            FvwmScript \
+            FvwmIconMan \
+            FvwmConsole \
+            FvwmCommandS \
+            FvwmEvent \
+            FvwmForm \
+            FvwmRearrange
+          do
+            test -x "$module_dir/$module"
+          done
+
+          test -L "$module_dir/FvwmAudio"
+          test "$(readlink "$module_dir/FvwmAudio")" = FvwmEvent
+          readlink "$module_dir/FvwmAudio" | tee artifacts/fvwmaudio-target.txt
+
+          find "$stage" -type f \( -name '*.la' -o -name '*.a' \) -print \
+            | tee artifacts/static-or-libtool-files.txt
+
+      - name: X11 smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$GITHUB_WORKSPACE/_staging"
+          export DISPLAY=:99
+          Xvfb "$DISPLAY" -screen 0 1024x768x24 >artifacts/xvfb.log 2>&1 &
+          xvfb_pid=$!
+          trap 'kill "$xvfb_pid" 2>/dev/null || :' EXIT
+
+          for _ in {1..20}; do
+            if test -S /tmp/.X11-unix/X99; then
+              break
+            fi
+            sleep 0.25
+          done
+          test -S /tmp/.X11-unix/X99
+
+          set +e
+          timeout 5s "$stage/usr/local/bin/fvwm" -f /dev/null \
+            >artifacts/fvwm-xvfb.log 2>&1
+          rc=$?
+          set -e
+
+          cat artifacts/fvwm-xvfb.log
+          printf 'exit=%d\n' "$rc" | tee artifacts/fvwm-xvfb-status.txt
+          if test "$rc" -ne 0 && test "$rc" -ne 124; then
+            echo "FVWM exited unexpectedly during Xvfb smoke test: rc=$rc" >&2
+            exit "$rc"
+          fi
+
+      - name: Upload source-build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fvwm-source-build-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
